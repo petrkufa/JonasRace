@@ -6,6 +6,9 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-apk:
     runs-on: ubuntu-latest
@@ -31,9 +34,6 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Add and sync Capacitor Android project
         run: |
           npx cap add android
@@ -44,10 +44,21 @@ jobs:
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk ../JonasRace.apk
 
-      - name: Upload JonasRace-debug.apk artifact
+      - name: Upload JonasRace.apk artifact
         uses: actions/upload-artifact@v4
         with:
-          name: JonasRace-debug.apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: JonasRace.apk
+          path: JonasRace.apk
           if-no-files-found: error
+
+      - name: Publish JonasRace.apk to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view v1.0.0 >/dev/null 2>&1; then
+            gh release upload v1.0.0 JonasRace.apk --clobber
+          else
+            gh release create v1.0.0 JonasRace.apk --title "JonasRace v1.0.0" --notes "Automaticky sestavená Android verze (APK) hry JonasRace." --latest
+          fi
