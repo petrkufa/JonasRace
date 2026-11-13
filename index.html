@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="cs">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0b2459" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <title>JonasRace</title>
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="game-canvas"></canvas>
+
+      <!-- LOBBY SCREEN -->
+      <div id="lobby-screen" class="overlay-screen">
+        <div class="lobby-card">
+          <div class="lobby-header">
+            <div class="title-wrap">
+              <h1 class="game-title">JONAS <span>RACE</span></h1>
+              <p class="game-subtitle">Multiplayer závody motorek</p>
+            </div>
+            <div id="net-status" class="net-badge connecting">
+              <span class="net-dot"></span>
+              <span class="net-text">Připojování...</span>
+            </div>
+          </div>
+
+          <section class="lobby-section">
+            <h2>1. Vyber si barvu motorky</h2>
+            <div id="color-grid" class="color-grid">
+              <button class="color-card selected" data-color="red" type="button">
+                <span class="swatch swatch-red"></span>
+                <span class="color-name">Červená</span>
+                <span class="color-badge">TVOJE</span>
+              </button>
+              <button class="color-card" data-color="blue" type="button">
+                <span class="swatch swatch-blue"></span>
+                <span class="color-name">Modrá</span>
+                <span class="color-badge">Volná</span>
+              </button>
+              <button class="color-card" data-color="green" type="button">
+                <span class="swatch swatch-green"></span>
+                <span class="color-name">Zelená</span>
+                <span class="color-badge">Volná</span>
+              </button>
+              <button class="color-card" data-color="yellow" type="button">
+                <span class="swatch swatch-yellow"></span>
+                <span class="color-name">Žlutá</span>
+                <span class="color-badge">Volná</span>
+              </button>
+            </div>
+          </section>
+
+          <section class="lobby-section">
+            <h2>2. Délka trati</h2>
+            <div id="length-grid" class="length-grid">
+              <button class="length-btn" data-length="short" type="button">
+                <strong>Krátká</strong>
+                <span>~45 s</span>
+              </button>
+              <button class="length-btn selected" data-length="medium" type="button">
+                <strong>Střední</strong>
+                <span>~75 s</span>
+              </button>
+              <button class="length-btn" data-length="long" type="button">
+                <strong>Dlouhá</strong>
+                <span>~110 s</span>
+              </button>
+            </div>
+          </section>
+
+          <section class="lobby-section">
+            <h2>3. Hráči v závodě (<span id="player-count">1</span>/4)</h2>
+            <div id="players-list" class="players-list"></div>
+          </section>
+
+          <button id="start-btn" class="primary-start-btn" type="button">
+            START ZÁVODU!
+          </button>
+          <p class="controls-tip">
+            Ovládání jedním prstem: <strong>Drž prst</strong> = PLYN • <strong>Posouvej do stran</strong> = ZATÁČENÍ
+          </p>
+        </div>
+      </div>
+
+      <!-- IN-RACE HUD -->
+      <div id="race-hud" class="race-hud hidden">
+        <div class="hud-top">
+          <div class="hud-panel score-panel">
+            <div class="hud-label">Score</div>
+            <div id="hud-score" class="hud-value">0</div>
+          </div>
+
+          <div id="hud-place" class="hud-place">1. / 1 • 0 %</div>
+
+          <div class="hud-right-col">
+            <div class="hud-panel speed-panel">
+              <div class="hud-label">Speed</div>
+              <div id="hud-speed" class="hud-value">0</div>
+              <div class="hud-unit">km/h</div>
+            </div>
+
+            <div class="hud-buttons">
+              <button id="sound-btn" class="circle-btn" type="button" aria-label="Zvuk">
+                <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
+                  <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
+                </svg>
+              </button>
+              <button id="pause-btn" class="circle-btn" type="button" aria-label="Pauza">
+                <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
+                  <path d="M6 5h4v14H6zm8 0h4v14h-4z" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div id="countdown-overlay" class="countdown-overlay hidden">3</div>
+        <div id="turbo-banner" class="turbo-banner hidden">TURBO!</div>
+        <div id="control-hint" class="control-hint hidden">
+          Drž prst = PLYN &nbsp;•&nbsp; Posouvej do stran = ZATÁČENÍ
+        </div>
+
+        <div class="hud-bottom">
+          <div class="minimap-wrap">
+            <canvas id="minimap" width="136" height="136"></canvas>
+          </div>
+          <div class="tacho-wrap">
+            <canvas id="tachometer" width="144" height="144"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- PAUSE MODAL -->
+      <div id="pause-overlay" class="modal-overlay hidden">
+        <div class="modal-card">
+          <h2>ZÁVOD POZASTAVEN</h2>
+          <button id="resume-btn" class="modal-btn primary" type="button">Pokračovat v jízdě</button>
+          <button id="quit-btn" class="modal-btn secondary" type="button">Zpět do garáže</button>
+        </div>
+      </div>
+
+      <!-- FINISH / PODIUM MODAL -->
+      <div id="finish-overlay" class="modal-overlay hidden">
+        <div class="modal-card finish-card">
+          <h2 id="finish-title">CÍL ZÁVODU!</h2>
+          <p id="finish-subtitle" class="finish-subtitle">1. MÍSTO!</p>
+          <div id="podium-list" class="podium-list"></div>
+          <button id="play-again-btn" class="primary-start-btn" type="button">
+            DALŠÍ ZÁVOD (Nová trať)
+          </button>
+          <button id="back-lobby-btn" class="modal-btn secondary" type="button">
+            Zpět do garáže
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
