@@ -33,9 +33,25 @@ export const BIKE_COLORS = {
     num: 0xffbe0b,
     dark: 0x996b00,
   },
+  purple: {
+    id: 'purple',
+    label: 'Fialová',
+    riderLabel: 'Fialový jezdec',
+    hex: '#a838ff',
+    num: 0xa838ff,
+    dark: 0x52128c,
+  },
+  orange: {
+    id: 'orange',
+    label: 'Oranžová',
+    riderLabel: 'Oranžový jezdec',
+    hex: '#ff6d1f',
+    num: 0xff6d1f,
+    dark: 0x993600,
+  },
 };
 
-export const BIKE_COLOR_ORDER = ['red', 'blue', 'green', 'yellow'];
+export const BIKE_COLOR_ORDER = ['red', 'blue', 'green', 'yellow', 'purple', 'orange'];
 
 export function createBikeMesh(colorId, isLocalPlayer = false) {
   const palette = BIKE_COLORS[colorId] || BIKE_COLORS.red;
@@ -295,18 +311,24 @@ export function createBikeMesh(colorId, isLocalPlayer = false) {
     rearWheel,
     turboFlame,
     indicator,
-    updateVisual(dt, speedMs, leanAngle, turboActive, bumpTimer, timeSec) {
+    updateVisual(dt, speedMs, leanAngle, turboActive, bumpTimer, timeSec, jumpY = 0) {
       // Spin wheels forward
       wheelSpin -= (speedMs / 0.35) * dt;
       frontWheel.rotation.x = wheelSpin;
       rearWheel.rotation.x = wheelSpin;
 
+      // Lift bike smoothly during jump while keeping shadow grounded on road
+      leanGroup.position.y = jumpY;
+      const shadowScale = Math.max(0.45, 1 - jumpY * 0.14);
+      shadow.scale.setScalar(shadowScale);
+      shadowMat.opacity = Math.max(0.14, 0.45 - jumpY * 0.08);
+
       // Lean whole bike smoothly + slight bump wobble
       const wobble = bumpTimer > 0 ? Math.sin(timeSec * 45) * 0.14 * bumpTimer : 0;
       leanGroup.rotation.z = leanAngle + wobble;
 
-      // Wheelie pitch during turbo boost
-      const targetPitch = turboActive ? 0.11 : 0;
+      // Wheelie / jump nose-up pitch
+      const targetPitch = jumpY > 0.05 ? 0.22 : turboActive ? 0.11 : 0;
       leanGroup.rotation.x += (targetPitch - leanGroup.rotation.x) * Math.min(1, dt * 8);
 
       // Turbo exhaust flame
@@ -316,10 +338,10 @@ export function createBikeMesh(colorId, isLocalPlayer = false) {
         turboFlame.scale.set(flicker, 0.9 + Math.random() * 0.4, flicker);
       }
 
-      // Bob remote indicator gently
+      // Bob remote indicator gently above helmet
       if (indicator) {
         indicator.rotation.y = timeSec * 2.4;
-        indicator.position.y = 2.08 + Math.sin(timeSec * 4) * 0.08;
+        indicator.position.y = 2.08 + jumpY + Math.sin(timeSec * 4) * 0.08;
       }
     },
   };

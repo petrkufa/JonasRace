@@ -3,6 +3,7 @@ import { BIKE_COLORS } from './bike.js';
 export class RaceHUD {
   constructor() {
     this.scoreEl = document.getElementById('hud-score');
+    this.coinsEl = document.getElementById('hud-coins');
     this.speedEl = document.getElementById('hud-speed');
     this.placeEl = document.getElementById('hud-place');
     this.minimapCanvas = document.getElementById('minimap');
@@ -11,6 +12,7 @@ export class RaceHUD {
     this.tachoCtx = this.tachoCanvas.getContext('2d');
 
     this.lastScoreText = '';
+    this.lastCoinsText = '';
     this.lastSpeedText = '';
     this.lastPlaceText = '';
     this.normalizedPath = [];
@@ -48,11 +50,19 @@ export class RaceHUD {
     }));
   }
 
-  update({ score, speedKmh, place, totalPlayers, progressPct, riders, dt }) {
+  update({ score, coins = 0, speedKmh, place, totalPlayers, progressPct, riders, dt }) {
     const scoreStr = String(Math.floor(score));
     if (scoreStr !== this.lastScoreText) {
       this.scoreEl.textContent = scoreStr;
       this.lastScoreText = scoreStr;
+    }
+
+    if (this.coinsEl) {
+      const coinsStr = `Mince: ${coins} (+${coins} km/h)`;
+      if (coinsStr !== this.lastCoinsText) {
+        this.coinsEl.textContent = coinsStr;
+        this.lastCoinsText = coinsStr;
+      }
     }
 
     const speedStr = String(Math.round(speedKmh));
@@ -181,7 +191,7 @@ export class RaceHUD {
     const cy = h * 0.5;
     const radius = Math.min(w, h) * 0.5 - 5;
 
-    const targetRatio = Math.max(0, Math.min(1, speedKmh / 240));
+    const targetRatio = Math.max(0, Math.min(1, speedKmh / 260));
     const smooth = Math.min(1, (dt || 0.016) * 10);
     this.needleRatio += (targetRatio - this.needleRatio) * smooth;
 

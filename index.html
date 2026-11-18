@@ -54,6 +54,16 @@
                 <span class="color-name">Žlutá</span>
                 <span class="color-badge">Volná</span>
               </button>
+              <button class="color-card" data-color="purple" type="button">
+                <span class="swatch swatch-purple"></span>
+                <span class="color-name">Fialová</span>
+                <span class="color-badge">Volná</span>
+              </button>
+              <button class="color-card" data-color="orange" type="button">
+                <span class="swatch swatch-orange"></span>
+                <span class="color-name">Oranžová</span>
+                <span class="color-badge">Volná</span>
+              </button>
             </div>
           </section>
 
@@ -76,7 +86,7 @@
           </section>
 
           <section class="lobby-section">
-            <h2>3. Hráči v závodě (<span id="player-count">1</span>/4)</h2>
+            <h2>3. Hráči v závodě (<span id="player-count">1</span>/6)</h2>
             <div id="players-list" class="players-list"></div>
           </section>
 
@@ -92,9 +102,12 @@
       <!-- IN-RACE HUD -->
       <div id="race-hud" class="race-hud hidden">
         <div class="hud-top">
-          <div class="hud-panel score-panel">
-            <div class="hud-label">Score</div>
-            <div id="hud-score" class="hud-value">0</div>
+          <div class="hud-left-col">
+            <div class="hud-panel score-panel">
+              <div class="hud-label">Score</div>
+              <div id="hud-score" class="hud-value">0</div>
+            </div>
+            <div id="hud-coins" class="hud-coins">Mince: 0 (+0 km/h)</div>
           </div>
 
           <div id="hud-place" class="hud-place">1. / 1 • 0 %</div>

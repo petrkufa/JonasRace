@@ -175,6 +175,102 @@ function createTurboTexture() {
   return tex;
 }
 
+function createRampTexture() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 256;
+  const ctx = canvas.getContext('2d');
+
+  ctx.fillStyle = '#241808';
+  ctx.fillRect(0, 0, 256, 256);
+
+  // Orange-yellow edge rails
+  ctx.fillStyle = '#ff7b00';
+  ctx.fillRect(0, 0, 20, 256);
+  ctx.fillRect(236, 0, 20, 256);
+
+  // Bright yellow/orange upward chevrons toward launch lip
+  const colors = ['#ffd426', '#ff8c00', '#ffd426'];
+  for (let i = 0; i < 3; i++) {
+    const y = 54 + i * 72;
+    ctx.beginPath();
+    ctx.moveTo(36, y + 44);
+    ctx.lineTo(128, y - 22);
+    ctx.lineTo(220, y + 44);
+    ctx.lineTo(220, y + 70);
+    ctx.lineTo(128, y + 4);
+    ctx.lineTo(36, y + 70);
+    ctx.closePath();
+    ctx.fillStyle = colors[i];
+    ctx.fill();
+  }
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+function createRampDeckGeometry() {
+  const w = 1.7; // half width -> 3.4m wide
+  const zBack = 3.2;
+  const zFront = -3.2;
+  const yBack = 0.04;
+  const yFront = 1.18;
+
+  const positions = new Float32Array([
+    -w, yBack, zBack,
+     w, yBack, zBack,
+    -w, yFront, zFront,
+     w, yFront, zFront,
+  ]);
+  const uvs = new Float32Array([
+    0, 0,
+    1, 0,
+    0, 1,
+    1, 1,
+  ]);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  geo.setIndex([0, 1, 2, 1, 3, 2]);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+function createRampSideGeometry() {
+  const w = 1.7;
+  const zBack = 3.2;
+  const zFront = -3.2;
+  const yBack = 0.02;
+  const yFront = 1.16;
+
+  const positions = new Float32Array([
+    // Left side triangle
+    -w, yBack, zBack,
+    -w, yBack, zFront,
+    -w, yFront, zFront,
+    // Right side triangle
+     w, yBack, zBack,
+     w, yFront, zFront,
+     w, yBack, zFront,
+    // Front vertical face
+    -w, yBack, zFront,
+     w, yBack, zFront,
+    -w, yFront, zFront,
+     w, yFront, zFront,
+  ]);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setIndex([
+    0, 1, 2,
+    3, 4, 5,
+    6, 7, 8,
+    7, 9, 8,
+  ]);
+  geo.computeVertexNormals();
+  return geo;
+}
+
 function createCheckerTexture(cols = 12, rows = 2) {
   const canvas = document.createElement('canvas');
   canvas.width = cols * 32;
@@ -568,9 +664,22 @@ export function createTrack(scene, seed, lengthId = 'medium') {
   addGate(12, 'START', '#0e368c');
   addGate(totalMeters, 'CÍL', '#0b6b2b');
 
-  // 7. Track Gameplay Items (turbo pads, coins, cones, puddles)
+  // 7. Track Gameplay Items (ramps, turbo pads, coins, cones, puddles)
   const items = [];
   const itemRand = mulberry32((seed ^ 0x9e3779b9) >>> 0);
+
+  const rampTex = register(createRampTexture());
+  const rampDeckGeo = register(createRampDeckGeometry());
+  const rampSideGeo = register(createRampSideGeometry());
+  const rampDeckMat = register(new THREE.MeshBasicMaterial({
+    map: rampTex,
+    side: THREE.DoubleSide,
+  }));
+  const rampSideMat = register(new THREE.MeshStandardMaterial({
+    color: 0xff7b00,
+    roughness: 0.45,
+    side: THREE.DoubleSide,
+  }));
 
   const turboTex = register(createTurboTexture());
   const turboGeo = register(new THREE.PlaneGeometry(2.7, 7.2));
@@ -618,7 +727,42 @@ export function createTrack(scene, seed, lengthId = 'medium') {
     const roll = itemRand();
     const lane = lanes[Math.floor(itemRand() * lanes.length)] + (itemRand() - 0.5) * 1.1;
 
-    if (roll < 0.22) {
+    if (roll < 0.16) {
+      // Jump ramp + 3 aerial bonus coins after takeoff
+      const frame = sampleAt(d);
+      const rampGroup = new THREE.Group();
+      const deckMesh = new THREE.Mesh(rampDeckGeo, rampDeckMat);
+      const sideMesh = new THREE.Mesh(rampSideGeo, rampSideMat);
+      rampGroup.add(deckMesh, sideMesh);
+      rampGroup.position.copy(frame.pos).addScaledVector(frame.right, lane);
+      rampGroup.rotation.y = frame.yaw;
+      group.add(rampGroup);
+      items.push({ type: 'ramp', dist: d, lateral: lane, radiusLat: 1.9, radiusDist: 3.4, mesh: rampGroup, cooldown: 0 });
+
+      for (let k = 0; k < 3; k++) {
+        const cd = d + 12 + k * 9;
+        if (cd >= totalMeters - 90) break;
+        const cFrame = sampleAt(cd);
+        const yOff = 2.15 + (k === 1 ? 0.55 : 0);
+        const cMesh = new THREE.Mesh(coinGeo, coinMat);
+        cMesh.position.copy(cFrame.pos).addScaledVector(cFrame.right, lane);
+        cMesh.position.y += yOff;
+        cMesh.rotation.y = cFrame.yaw;
+        group.add(cMesh);
+        items.push({
+          type: 'coin',
+          airCoin: true,
+          baseYOffset: yOff,
+          dist: cd,
+          lateral: lane,
+          radiusLat: 1.65,
+          radiusDist: 2.8,
+          mesh: cMesh,
+          collected: false,
+        });
+      }
+      d += 68 + itemRand() * 32;
+    } else if (roll < 0.30) {
       // Turbo pad
       const frame = sampleAt(d);
       const mesh = new THREE.Mesh(turboGeo, turboMat);
@@ -627,8 +771,8 @@ export function createTrack(scene, seed, lengthId = 'medium') {
       mesh.rotation.y = frame.yaw;
       group.add(mesh);
       items.push({ type: 'turbo', dist: d, lateral: lane, radiusLat: 1.7, radiusDist: 4.0, mesh, cooldown: 0 });
-      d += 65 + itemRand() * 35;
-    } else if (roll < 0.68) {
+      d += 62 + itemRand() * 32;
+    } else if (roll < 0.74) {
       // Line of 3 golden coins
       const coinLineLane = lane;
       for (let k = 0; k < 3; k++) {
@@ -640,10 +784,20 @@ export function createTrack(scene, seed, lengthId = 'medium') {
         mesh.position.y += 0.95;
         mesh.rotation.y = frame.yaw;
         group.add(mesh);
-        items.push({ type: 'coin', dist: cd, lateral: coinLineLane, radiusLat: 1.55, radiusDist: 2.5, mesh, collected: false });
+        items.push({
+          type: 'coin',
+          airCoin: false,
+          baseYOffset: 0.95,
+          dist: cd,
+          lateral: coinLineLane,
+          radiusLat: 1.55,
+          radiusDist: 2.5,
+          mesh,
+          collected: false,
+        });
       }
-      d += 55 + itemRand() * 30;
-    } else if (roll < 0.86) {
+      d += 52 + itemRand() * 28;
+    } else if (roll < 0.88) {
       // Traffic cone obstacle (leaves 2 other lanes completely free)
       const frame = sampleAt(d);
       const coneGroup = new THREE.Group();
@@ -694,7 +848,8 @@ export function createTrack(scene, seed, lengthId = 'medium') {
       for (const item of items) {
         if (item.type === 'coin' && !item.collected) {
           item.mesh.rotation.y = timeSec * 3.0 + item.dist * 0.1;
-          item.mesh.position.y = sampleAt(item.dist).pos.y + 0.95 + Math.sin(timeSec * 4 + item.dist) * 0.12;
+          const yOff = item.baseYOffset ?? 0.95;
+          item.mesh.position.y = sampleAt(item.dist).pos.y + yOff + Math.sin(timeSec * 4 + item.dist) * 0.12;
         }
         if (item.cooldown > 0) {
           item.cooldown = Math.max(0, item.cooldown - dt);

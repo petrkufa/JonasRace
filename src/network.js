@@ -7,7 +7,7 @@ const MQTT_BROKERS = [
   'wss://broker.emqx.io:8084/mqtt',
   'wss://broker.hivemq.com:8884/mqtt',
 ];
-const MAX_PLAYERS = 4;
+const MAX_PLAYERS = 6;
 const IDLE_SLEEP_MS = 45000;
 const PEER_TIMEOUT_MS = 5000;
 const RTC_CONFIG = {
@@ -22,6 +22,7 @@ export class MultiplayerManager {
     this.localColor = 'red';
     this.lengthId = 'medium';
     this.localState = 'LOBBY';
+    this.localReady = false;
 
     // Map<peerId, PeerInfo>
     this.peers = new Map();
@@ -130,6 +131,7 @@ export class MultiplayerManager {
   enterSleep() {
     if (this.isSleeping) return;
     this.isSleeping = true;
+    this.localReady = false;
     this.broadcast('bye', {}, { forceShared: true });
     if (this.peers.size > 0) {
       this.peers.clear();
@@ -565,6 +567,7 @@ export class MultiplayerManager {
         joinedAt: payload?.joinedAt || now,
         color: payload?.color || 'blue',
         state: payload?.state || 'LOBBY',
+        ready: Boolean(payload?.ready),
         d: 0,
         lateral: 0,
         speed: 0,
@@ -572,6 +575,8 @@ export class MultiplayerManager {
         throttling: false,
         lean: 0,
         score: 0,
+        coins: 0,
+        jumpY: 0,
         turbo: false,
         finished: false,
         finishTime: null,
@@ -589,9 +594,11 @@ export class MultiplayerManager {
     if (type === 'hello') {
       const prevColor = peer.color;
       const prevState = peer.state;
+      const prevReady = peer.ready;
       peer.joinedAt = payload.joinedAt ?? peer.joinedAt;
       peer.color = payload.color ?? peer.color;
       peer.state = payload.state ?? peer.state;
+      peer.ready = Boolean(payload.ready);
 
       if (payload.lengthId && payload.lengthId !== this.lengthId && this.localState === 'LOBBY') {
         if (payload.lengthUpdatedAt && payload.lengthUpdatedAt > (this.lastLengthUpdate || 0)) {
@@ -609,9 +616,20 @@ export class MultiplayerManager {
           this.sendHello();
         }
         this.emitRoomUpdate();
-      } else if (this.resolveColorConflict() || prevColor !== peer.color || prevState !== peer.state) {
+      } else if (
+        this.resolveColorConflict() ||
+        prevColor !== peer.color ||
+        prevState !== peer.state ||
+        prevReady !== peer.ready
+      ) {
         this.emitRoomUpdate();
       }
+    } else if (type === 'ready_change') {
+      peer.ready = Boolean(payload.ready);
+      if (payload.state) {
+        peer.state = payload.state;
+      }
+      this.emitRoomUpdate();
     } else if (type === 'ping') {
       this.broadcast('pong', { to: from, pingTs: payload.pingTs });
     } else if (type === 'pong') {
@@ -628,6 +646,15 @@ export class MultiplayerManager {
     } else if (type === 'race_start') {
       const hidden = typeof document !== 'undefined' && document.hidden;
       if (this.isSleeping || hidden) return;
+      this.localReady = false;
+      for (const p of this.peers.values()) {
+        p.ready = false;
+        p.finished = false;
+        p.finishTime = null;
+        p.coins = 0;
+        p.jumpY = 0;
+        p.state = 'COUNTDOWN';
+      }
       if (payload.lengthId) {
         this.lengthId = payload.lengthId;
         this.callbacks.onLengthChange?.(this.lengthId);
@@ -641,6 +668,8 @@ export class MultiplayerManager {
       peer.throttling = Boolean(payload.throttling);
       peer.lean = payload.lean;
       peer.score = payload.score;
+      peer.coins = payload.coins ?? 0;
+      peer.jumpY = payload.jumpY ?? 0;
       peer.turbo = Boolean(payload.turbo);
       peer.finished = Boolean(payload.finished);
       peer.finishTime = payload.finishTime ?? peer.finishTime;
@@ -651,7 +680,9 @@ export class MultiplayerManager {
       peer.finishTime = payload.finishTime;
       peer.score = payload.score;
       peer.state = 'FINISHED';
+      peer.ready = false;
       this.callbacks.onPeerFinish?.(peer);
+      this.emitRoomUpdate();
     }
   }
 
@@ -705,9 +736,23 @@ export class MultiplayerManager {
   setLocalState(state) {
     this.markActivity();
     this.localState = state;
+    if (state === 'LOBBY') {
+      this.localReady = false;
+    }
     if (!this.isSleeping) {
       this.sendHello();
     }
+  }
+
+  setReady(ready) {
+    this.markActivity();
+    this.localReady = Boolean(ready);
+    this.broadcast('ready_change', {
+      ready: this.localReady,
+      state: this.localState,
+    });
+    this.sendHello();
+    this.emitRoomUpdate();
   }
 
   sendHello() {
@@ -716,6 +761,7 @@ export class MultiplayerManager {
       joinedAt: this.joinedAt,
       color: this.localColor,
       state: this.localState,
+      ready: this.localReady,
       lengthId: this.lengthId,
       lengthUpdatedAt: this.lastLengthUpdate || 0,
     });
@@ -728,8 +774,17 @@ export class MultiplayerManager {
 
   startRace(seed, lengthId) {
     this.markActivity();
+    this.localReady = false;
     this.localState = 'COUNTDOWN';
     this.lengthId = lengthId;
+    for (const p of this.peers.values()) {
+      p.ready = false;
+      p.finished = false;
+      p.finishTime = null;
+      p.coins = 0;
+      p.jumpY = 0;
+      p.state = 'COUNTDOWN';
+    }
     this.broadcast('race_start', {
       seed,
       lengthId,
@@ -745,6 +800,7 @@ export class MultiplayerManager {
 
   sendFinish(finishTime, score) {
     this.localState = 'FINISHED';
+    this.localReady = false;
     this.broadcast('race_finish', { finishTime, score });
   }
 
@@ -755,6 +811,8 @@ export class MultiplayerManager {
         isLocal: true,
         color: this.localColor,
         state: this.localState,
+        ready: this.localReady,
+        finished: this.localState === 'FINISHED',
         joinedAt: this.joinedAt,
       },
     ];
@@ -764,6 +822,8 @@ export class MultiplayerManager {
         isLocal: false,
         color: peer.color,
         state: peer.state,
+        ready: Boolean(peer.ready),
+        finished: Boolean(peer.finished),
         joinedAt: peer.joinedAt,
       });
     }

@@ -92,8 +92,11 @@ let raceElapsed = 0;
 let hintTimer = 0;
 let turboBannerTimer = 0;
 let lastNetSend = 0;
+let lastPodiumRefresh = 0;
 let bikeBumpCooldown = 0;
 let muted = false;
+let prevPeerCount = 0;
+let readyAutoStartTimer = null;
 
 const localRider = {
   d: 8,
@@ -103,6 +106,9 @@ const localRider = {
   lean: 0,
   score: 0,
   scoreAccum: 0,
+  coins: 0,
+  jumpY: 0,
+  jumpVelY: 0,
   turboTimer: 0,
   slowTimer: 0,
   bumpTimer: 0,
@@ -205,16 +211,24 @@ const network = new MultiplayerManager({
     netStatusEl.classList.toggle('online', status.online);
   },
   onRoomUpdate(players) {
+    if (prevPeerCount > 1 && players.length === 1 && network.localReady && gameState === 'LOBBY') {
+      network.setReady(false);
+      prevPeerCount = players.length;
+      return;
+    }
+    prevPeerCount = players.length;
     renderLobbyUI(players);
     if (gameState === 'FINISHED') {
       renderPodium();
     }
+    checkAndTriggerStartIfAllReady();
   },
   onLengthChange(lengthId) {
     selectedLength = lengthId;
     updateLengthButtons();
   },
   onRaceStart(payload) {
+    clearTimeout(readyAutoStartTimer);
     if (gameState === 'COUNTDOWN' || gameState === 'RACING') return;
     beginCountdown(payload.seed, payload.lengthId || selectedLength);
   },
@@ -222,12 +236,58 @@ const network = new MultiplayerManager({
     if (gameState === 'FINISHED') {
       renderPodium();
     }
+    if (gameState === 'LOBBY') {
+      renderLobbyUI();
+    }
+    checkAndTriggerStartIfAllReady();
   },
 });
 
 network.start();
 
-// === LOBBY UI BINDINGS ===
+// === LOBBY & READY FLOW ===
+function isAnyPeerStillRacing() {
+  for (const peer of network.peers.values()) {
+    if (peer.state === 'RACING' || peer.state === 'COUNTDOWN') {
+      return true;
+    }
+  }
+  return false;
+}
+
+function checkAndTriggerStartIfAllReady() {
+  if (gameState !== 'LOBBY' && gameState !== 'FINISHED') return;
+  if (isAnyPeerStillRacing()) return;
+
+  const players = network.getPlayersSnapshot();
+  if (players.length === 0) return;
+
+  const allReady = players.every((p) => p.ready);
+  if (!allReady) {
+    clearTimeout(readyAutoStartTimer);
+    return;
+  }
+
+  if (players[0].isLocal) {
+    clearTimeout(readyAutoStartTimer);
+    const seed = Math.floor(Math.random() * 1_000_000_000) + 1;
+    network.startRace(seed, selectedLength);
+    beginCountdown(seed, selectedLength);
+  } else {
+    clearTimeout(readyAutoStartTimer);
+    readyAutoStartTimer = setTimeout(() => {
+      if ((gameState === 'LOBBY' || gameState === 'FINISHED') && !isAnyPeerStillRacing()) {
+        const latest = network.getPlayersSnapshot();
+        if (latest.length > 0 && latest.every((p) => p.ready)) {
+          const seed = Math.floor(Math.random() * 1_000_000_000) + 1;
+          network.startRace(seed, selectedLength);
+          beginCountdown(seed, selectedLength);
+        }
+      }
+    }, 550);
+  }
+}
+
 function updateLengthButtons() {
   for (const btn of lengthBtns) {
     btn.classList.toggle('selected', btn.dataset.length === selectedLength);
@@ -261,16 +321,22 @@ function renderLobbyUI(players = network.getPlayersSnapshot()) {
   playerCountEl.textContent = String(players.length);
   playersListEl.innerHTML = '';
 
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 6; i++) {
     const p = players[i];
     const row = document.createElement('div');
     if (p) {
       const palette = BIKE_COLORS[p.color] || BIKE_COLORS.red;
+      let statusTag = 'Nepřipraven';
+      if (p.state === 'RACING' || p.state === 'COUNTDOWN') {
+        statusTag = 'Závodí';
+      } else if (p.ready) {
+        statusTag = 'Připraven ✓';
+      }
       row.className = 'player-row';
       row.innerHTML = `
         <span class="player-dot" style="background:${palette.hex}"></span>
         <span>${p.isLocal ? 'Ty' : `Kamarád ${i + 1}`} (${palette.riderLabel})</span>
-        <span class="player-tag">${p.isLocal ? 'Připraven' : p.state === 'RACING' ? 'Závodí' : 'Připojen'}</span>
+        <span class="player-tag">${statusTag}</span>
       `;
     } else {
       row.className = 'player-row empty';
@@ -280,6 +346,27 @@ function renderLobbyUI(players = network.getPlayersSnapshot()) {
       `;
     }
     playersListEl.appendChild(row);
+  }
+
+  // Start / Ready button state
+  if (isAnyPeerStillRacing()) {
+    startBtn.disabled = true;
+    startBtn.classList.remove('ready-waiting');
+    startBtn.textContent = 'PROBÍHÁ ZÁVOD (Čeká se na dojetí...)';
+  } else {
+    startBtn.disabled = false;
+    const total = players.length;
+    const readyCount = players.filter((p) => p.ready).length;
+    if (total <= 1) {
+      startBtn.classList.remove('ready-waiting');
+      startBtn.textContent = 'START ZÁVODU!';
+    } else if (network.localReady) {
+      startBtn.classList.add('ready-waiting');
+      startBtn.textContent = `ČEKÁ SE NA OSTATNÍ... (${readyCount}/${total})`;
+    } else {
+      startBtn.classList.remove('ready-waiting');
+      startBtn.textContent = `JSEM PŘIPRAVEN! (${readyCount}/${total})`;
+    }
   }
 
   if (gameState === 'LOBBY') {
@@ -309,16 +396,18 @@ lengthBtns.forEach((btn) => {
 
 startBtn.addEventListener('click', () => {
   sound.unlock();
-  const seed = Math.floor(Math.random() * 1_000_000_000) + 1;
-  network.startRace(seed, selectedLength);
-  beginCountdown(seed, selectedLength);
+  if (isAnyPeerStillRacing()) return;
+  network.setReady(!network.localReady);
+  renderLobbyUI();
+  checkAndTriggerStartIfAllReady();
 });
 
 playAgainBtn.addEventListener('click', () => {
   sound.unlock();
-  const seed = Math.floor(Math.random() * 1_000_000_000) + 1;
-  network.startRace(seed, selectedLength);
-  beginCountdown(seed, selectedLength);
+  if (isAnyPeerStillRacing()) return;
+  network.setReady(!network.localReady);
+  renderPodium();
+  checkAndTriggerStartIfAllReady();
 });
 
 backLobbyBtn.addEventListener('click', () => {
@@ -385,6 +474,8 @@ function sendLocalRaceStateNow(now = performance.now()) {
     throttling: isThrottlingInput(),
     lean: localRider.lean,
     score: Math.floor(localRider.score),
+    coins: localRider.coins,
+    jumpY: Number(localRider.jumpY.toFixed(2)),
     turbo: localRider.turboTimer > 0,
     finished: localRider.finished,
     finishTime: localRider.finishTime,
@@ -406,6 +497,9 @@ function ensureRemoteRiderVisual(peer) {
       throttling: Boolean(peer.throttling),
       lean: peer.lean || 0,
       score: peer.score || 0,
+      coins: peer.coins || 0,
+      jumpY: peer.jumpY || 0,
+      netTargetJumpY: peer.jumpY || 0,
       turbo: false,
       finished: false,
       finishTime: null,
@@ -427,10 +521,13 @@ function getStartingLateral(index, total) {
   if (total <= 1) return 0;
   if (total === 2) return index === 0 ? -2.2 : 2.2;
   if (total === 3) return [-3.6, 0, 3.6][index] ?? 0;
-  return [-4.5, -1.5, 1.5, 4.5][index] ?? 0;
+  if (total === 4) return [-4.5, -1.5, 1.5, 4.5][index] ?? 0;
+  if (total === 5) return [-5.2, -2.6, 0, 2.6, 5.2][index] ?? 0;
+  return [-5.5, -3.3, -1.1, 1.1, 3.3, 5.5][index] ?? 0;
 }
 
 function beginCountdown(seed, lengthId) {
+  clearTimeout(readyAutoStartTimer);
   selectedLength = lengthId;
   updateLengthButtons();
   loadSceneTrack(seed, lengthId);
@@ -450,6 +547,9 @@ function beginCountdown(seed, lengthId) {
       localRider.lean = 0;
       localRider.score = 0;
       localRider.scoreAccum = 0;
+      localRider.coins = 0;
+      localRider.jumpY = 0;
+      localRider.jumpVelY = 0;
       localRider.turboTimer = 0;
       localRider.slowTimer = 0;
       localRider.bumpTimer = 0;
@@ -465,6 +565,9 @@ function beginCountdown(seed, lengthId) {
       remote.steer = 0;
       remote.throttling = false;
       remote.lean = 0;
+      remote.coins = 0;
+      remote.jumpY = 0;
+      remote.netTargetJumpY = 0;
       remote.lastPacketAt = 0;
     }
   });
@@ -511,11 +614,15 @@ function returnToLobby() {
   localRider.lateral = 0;
   localRider.speed = 0;
   localRider.lean = 0;
+  localRider.coins = 0;
+  localRider.jumpY = 0;
+  localRider.jumpVelY = 0;
   rebuildLocalBikeMesh(network.localColor);
   renderLobbyUI();
 }
 
-function showTurboBanner() {
+function showBanner(text) {
+  turboBannerEl.textContent = text;
   turboBannerTimer = 1.3;
   turboBannerEl.classList.remove('hidden');
 }
@@ -530,6 +637,7 @@ function buildRaceStandings() {
       score: Math.floor(localRider.score),
       finished: localRider.finished,
       finishTime: localRider.finishTime,
+      ready: network.localReady,
     },
   ];
 
@@ -543,6 +651,7 @@ function buildRaceStandings() {
         score: Math.floor(peer.score || 0),
         finished: Boolean(peer.finished),
         finishTime: peer.finishTime,
+        ready: Boolean(peer.ready),
       });
     }
   }
@@ -577,20 +686,47 @@ function renderPodium() {
     const timeText = entry.finished && entry.finishTime != null
       ? `${entry.finishTime.toFixed(1)} s`
       : `${Math.round((entry.d / currentTrack.totalMeters) * 100)} %`;
+    const readySuffix = entry.ready ? ' • ✓ Připraven' : '';
     row.innerHTML = `
       <span class="podium-rank">${idx + 1}.</span>
       <span class="player-dot" style="background:${palette.hex}"></span>
       <span>${entry.isLocal ? 'Ty' : 'Kamarád'} (${palette.label})</span>
-      <span class="podium-meta">${timeText} • ${entry.score} b.</span>
+      <span class="podium-meta">${timeText} • ${entry.score} b.${readySuffix}</span>
     `;
     podiumListEl.appendChild(row);
   });
+
+  const stillRacing = isAnyPeerStillRacing();
+  const finishedCount = standings.filter((e) => e.finished).length;
+
+  if (stillRacing) {
+    playAgainBtn.disabled = true;
+    playAgainBtn.classList.remove('ready-waiting');
+    playAgainBtn.textContent = `Čeká se na dojetí ostatních... (${finishedCount}/${standings.length} v cíli)`;
+  } else {
+    playAgainBtn.disabled = false;
+    const players = network.getPlayersSnapshot();
+    const total = players.length;
+    const readyCount = players.filter((p) => p.ready).length;
+    if (total <= 1) {
+      playAgainBtn.classList.remove('ready-waiting');
+      playAgainBtn.textContent = 'DALŠÍ ZÁVOD (Nová trať)';
+    } else if (network.localReady) {
+      playAgainBtn.classList.add('ready-waiting');
+      playAgainBtn.textContent = `ČEKÁ SE NA OSTATNÍ... (${readyCount}/${total})`;
+    } else {
+      playAgainBtn.classList.remove('ready-waiting');
+      playAgainBtn.textContent = `PŘIPRAVEN NA DALŠÍ ZÁVOD (${readyCount}/${total})`;
+    }
+  }
 }
 
 function finishLocalRace() {
   localRider.finished = true;
   localRider.finishTime = raceElapsed;
   localRider.score += 250;
+  localRider.jumpY = 0;
+  localRider.jumpVelY = 0;
   gameState = 'FINISHED';
   pointerActive = false;
 
@@ -602,6 +738,8 @@ function finishLocalRace() {
     throttling: false,
     lean: 0,
     score: Math.floor(localRider.score),
+    coins: localRider.coins,
+    jumpY: 0,
     turbo: false,
     finished: true,
     finishTime: localRider.finishTime,
@@ -636,6 +774,7 @@ function positionBikeAndCamera(dt, timeSec, snapImmediate = false) {
     localRider.turboTimer > 0,
     localRider.bumpTimer,
     timeSec,
+    localRider.jumpY,
   );
 
   const aheadFrame = currentTrack.sampleAt(Math.min(currentTrack.totalMeters, localRider.d + 16));
@@ -643,12 +782,12 @@ function positionBikeAndCamera(dt, timeSec, snapImmediate = false) {
     .copy(frame.pos)
     .addScaledVector(frame.tangent, -4.8)
     .addScaledVector(frame.right, localRider.lateral * 0.72);
-  _camPosTarget.y += 2.45;
+  _camPosTarget.y += 2.45 + localRider.jumpY * 0.65;
 
   _lookTarget
     .copy(aheadFrame.pos)
     .addScaledVector(aheadFrame.right, localRider.lateral * 0.42);
-  _lookTarget.y += 1.05;
+  _lookTarget.y += 1.05 + localRider.jumpY * 0.4;
 
   if (snapImmediate) {
     camera.position.copy(_camPosTarget);
@@ -689,12 +828,14 @@ function updateRemoteBikes(dt, timeSec) {
       entry.speed = peer.speed ?? entry.speed;
       entry.steer = peer.steer ?? 0;
       entry.throttling = Boolean(peer.throttling);
+      entry.coins = peer.coins ?? entry.coins ?? 0;
+      entry.netTargetJumpY = peer.jumpY ?? 0;
       entry.turbo = Boolean(peer.turbo);
       entry.finished = Boolean(peer.finished);
     }
 
     if (!entry.finished && peer.state === 'RACING') {
-      const topSpeed = entry.turbo ? 66 : 52;
+      const topSpeed = ((entry.turbo ? 230 : 180) + (entry.coins || 0)) / 3.6;
       if (entry.throttling || entry.turbo) {
         const accel = entry.turbo ? 38 : 22;
         if (entry.speed < topSpeed) {
@@ -729,16 +870,18 @@ function updateRemoteBikes(dt, timeSec) {
 
       const targetLean = -entry.steer * 0.44 * Math.min(1, entry.speed / 15 + 0.2);
       entry.lean += (targetLean - entry.lean) * Math.min(1, dt * 10);
+      entry.jumpY += ((entry.netTargetJumpY || 0) - (entry.jumpY || 0)) * Math.min(1, dt * 16);
     } else if (entry.finished) {
       entry.speed = Math.max(0, entry.speed - 24 * dt);
       entry.d = Math.min(currentTrack.totalMeters + 25, entry.d + entry.speed * dt);
       entry.lean += (0 - entry.lean) * Math.min(1, dt * 8);
+      entry.jumpY = Math.max(0, (entry.jumpY || 0) - 12 * dt);
     }
 
     const frame = currentTrack.sampleAt(entry.d);
     entry.visual.group.position.copy(frame.pos).addScaledVector(frame.right, entry.lateral);
     entry.visual.group.rotation.y = frame.yaw;
-    entry.visual.updateVisual(dt, entry.speed, entry.lean, entry.turbo, 0, timeSec);
+    entry.visual.updateVisual(dt, entry.speed, entry.lean, entry.turbo, 0, timeSec, entry.jumpY || 0);
   }
 
   // Clean up disconnected or lobby-returned peers
@@ -760,7 +903,13 @@ function updateLocalPhysics(dt) {
   if (localRider.bumpTimer > 0) localRider.bumpTimer = Math.max(0, localRider.bumpTimer - dt);
   if (bikeBumpCooldown > 0) bikeBumpCooldown = Math.max(0, bikeBumpCooldown - dt);
 
-  const topSpeed = localRider.turboTimer > 0 ? 66 : localRider.slowTimer > 0 ? 28 : 52;
+  const bonusKmh = localRider.coins;
+  const topSpeed =
+    localRider.turboTimer > 0
+      ? (230 + bonusKmh) / 3.6
+      : localRider.slowTimer > 0
+        ? 28
+        : (180 + bonusKmh) / 3.6;
 
   if (throttling || localRider.turboTimer > 0) {
     const accel = localRider.turboTimer > 0 ? 38 : 22;
@@ -772,6 +921,16 @@ function updateLocalPhysics(dt) {
   } else {
     // Finger lifted: smooth braking/slowdown
     localRider.speed = Math.max(0, localRider.speed - 28 * dt);
+  }
+
+  // Jump vertical flight physics
+  if (localRider.jumpY > 0 || localRider.jumpVelY > 0) {
+    localRider.jumpY += localRider.jumpVelY * dt;
+    localRider.jumpVelY -= 25 * dt;
+    if (localRider.jumpY <= 0) {
+      localRider.jumpY = 0;
+      localRider.jumpVelY = 0;
+    }
   }
 
   // Forward travel
@@ -817,31 +976,41 @@ function updateLocalPhysics(dt) {
     }
   }
 
-  // Track items: coins, turbo pads, cones, puddles
+  // Track items: ramps, coins, turbo pads, cones, puddles
   for (const item of currentTrack.items) {
     if (Math.abs(item.dist - localRider.d) > item.radiusDist) continue;
     if (Math.abs(item.lateral - localRider.lateral) > item.radiusLat) continue;
 
-    if (item.type === 'coin' && !item.collected) {
-      item.collected = true;
-      item.mesh.visible = false;
-      localRider.score += 100;
-      sound.playCoin();
-    } else if (item.type === 'turbo' && item.cooldown <= 0) {
+    if (item.type === 'ramp' && item.cooldown <= 0 && localRider.jumpY <= 0.12) {
+      item.cooldown = 1.2;
+      localRider.jumpVelY = Math.max(8.5, Math.min(13.5, localRider.speed * 0.24));
+      localRider.score += 120;
+      sound.playJump();
+      showBanner('SKOK!');
+    } else if (item.type === 'coin' && !item.collected) {
+      const canCollect = item.airCoin ? localRider.jumpY > 0.45 : localRider.jumpY < 1.55;
+      if (canCollect) {
+        item.collected = true;
+        item.mesh.visible = false;
+        localRider.coins += 1;
+        localRider.score += 100;
+        sound.playCoin();
+      }
+    } else if (item.type === 'turbo' && item.cooldown <= 0 && localRider.jumpY < 0.7) {
       item.cooldown = 1.6;
       localRider.turboTimer = 2.2;
-      localRider.speed = Math.max(localRider.speed, 62);
+      localRider.speed = Math.max(localRider.speed, (220 + localRider.coins) / 3.6);
       localRider.score += 150;
       sound.playTurbo();
-      showTurboBanner();
-    } else if (item.type === 'cone' && !item.hit) {
+      showBanner('TURBO!');
+    } else if (item.type === 'cone' && !item.hit && localRider.jumpY <= 0.35) {
       item.hit = true;
       item.mesh.visible = false;
       localRider.slowTimer = 0.9;
       localRider.speed = Math.min(localRider.speed, 24);
       localRider.bumpTimer = 0.3;
       sound.playBump();
-    } else if (item.type === 'puddle' && item.cooldown <= 0) {
+    } else if (item.type === 'puddle' && item.cooldown <= 0 && localRider.jumpY <= 0.35) {
       item.cooldown = 1.5;
       localRider.slowTimer = 1.1;
       localRider.speed = Math.min(localRider.speed, 26);
@@ -886,6 +1055,7 @@ function updateHudDisplay(dt) {
 
   hud.update({
     score: localRider.score,
+    coins: localRider.coins,
     speedKmh: localRider.speed * 3.6,
     place,
     totalPlayers: standings.length,
@@ -984,6 +1154,10 @@ function animate(now) {
     updateRemoteBikes(dt, timeSec);
     positionBikeAndCamera(dt, timeSec);
     updateHudDisplay(dt);
+    if (now - lastPodiumRefresh >= 220) {
+      lastPodiumRefresh = now;
+      renderPodium();
+    }
   }
 
   renderer.render(scene, camera);
