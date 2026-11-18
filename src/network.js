@@ -1,12 +1,18 @@
 import mqtt from 'mqtt';
 import { BIKE_COLOR_ORDER } from './bike.js';
 
-const TOPIC = 'jonasrace/v1/room/default';
+const TOPIC = 'jonasrace/v2/room/default';
+const BC_CHANNEL = 'jonas-race-room-v2';
 const MQTT_BROKERS = [
   'wss://broker.emqx.io:8084/mqtt',
   'wss://broker.hivemq.com:8884/mqtt',
 ];
 const MAX_PLAYERS = 4;
+const IDLE_SLEEP_MS = 45000;
+const PEER_TIMEOUT_MS = 5000;
+const RTC_CONFIG = {
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+};
 
 export class MultiplayerManager {
   constructor(callbacks = {}) {
@@ -19,8 +25,14 @@ export class MultiplayerManager {
 
     // Map<peerId, PeerInfo>
     this.peers = new Map();
+    // Map<peerId, { pc, dc, makingOffer, pendingIce: RTCIceCandidateInit[] }>
+    this.rtcPeers = new Map();
     this.seenMsgs = new Map();
     this.msgCounter = 0;
+
+    // Activity & background sleep state (prevents hidden/idle ghost players)
+    this.lastActivityAt = Date.now();
+    this.isSleeping = typeof document !== 'undefined' ? Boolean(document.hidden) : false;
 
     // Transport state
     this.bc = null;
@@ -43,38 +55,101 @@ export class MultiplayerManager {
     this.initLocalWebSocket();
     this.initMqtt(0);
 
-    // Send hello right away and every 2 seconds
-    this.sendHello();
-    this.heartbeatTimer = setInterval(() => {
+    window.addEventListener('pointerdown', this.markActivity, { passive: true });
+    window.addEventListener('pointermove', this.markActivity, { passive: true });
+    window.addEventListener('touchstart', this.markActivity, { passive: true });
+    window.addEventListener('keydown', this.markActivity);
+    window.addEventListener('beforeunload', this.handleUnload);
+    window.addEventListener('pagehide', this.handlePageHide);
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+
+    if (!this.isSleeping) {
       this.sendHello();
+    }
+
+    this.heartbeatTimer = setInterval(() => {
+      const hidden = typeof document !== 'undefined' && document.hidden;
+      const idleLobby = this.localState === 'LOBBY' && Date.now() - this.lastActivityAt > IDLE_SLEEP_MS;
+      if (hidden || idleLobby) {
+        this.enterSleep();
+        return;
+      }
+      if (!this.isSleeping) {
+        this.sendHello();
+        if (this.peers.size > 0) {
+          this.sendLatencyPing();
+        }
+      }
     }, 2000);
 
-    // Prune timed-out peers
+    // Prune timed-out peers quickly
     this.pruneTimer = setInterval(() => {
       const now = Date.now();
       let changed = false;
       for (const [id, peer] of this.peers.entries()) {
-        if (now - peer.lastSeen > 8000) {
+        if (now - peer.lastSeen > PEER_TIMEOUT_MS) {
           this.peers.delete(id);
+          this.closeRtcPeer(id);
           changed = true;
         }
       }
       if (changed) {
         this.emitRoomUpdate();
       }
-    }, 1500);
-
-    window.addEventListener('beforeunload', this.handleUnload);
+    }, 1000);
   }
 
-  handleUnload = () => {
-    this.broadcast('bye', {});
+  markActivity = () => {
+    this.lastActivityAt = Date.now();
+    const hidden = typeof document !== 'undefined' && document.hidden;
+    if (this.isSleeping && !hidden && !this.destroyed) {
+      this.wakeUp();
+    }
   };
+
+  handleVisibilityChange = () => {
+    if (typeof document === 'undefined') return;
+    if (document.hidden) {
+      this.enterSleep();
+    } else {
+      this.lastActivityAt = Date.now();
+      this.wakeUp();
+    }
+  };
+
+  handlePageHide = () => {
+    this.enterSleep();
+  };
+
+  handleUnload = () => {
+    this.broadcast('bye', {}, { forceShared: true });
+  };
+
+  enterSleep() {
+    if (this.isSleeping) return;
+    this.isSleeping = true;
+    this.broadcast('bye', {}, { forceShared: true });
+    if (this.peers.size > 0) {
+      this.peers.clear();
+      this.emitRoomUpdate();
+    }
+    this.closeAllRtc();
+  }
+
+  wakeUp() {
+    if (!this.isSleeping || this.destroyed) return;
+    this.isSleeping = false;
+    this.joinedAt = Date.now();
+    this.sendHello();
+    this.emitRoomUpdate();
+  }
 
   initBroadcastChannel() {
     if (typeof BroadcastChannel === 'undefined') return;
     try {
-      this.bc = new BroadcastChannel('jonas-race-room-v1');
+      this.bc = new BroadcastChannel(BC_CHANNEL);
       this.bc.onmessage = (ev) => {
         if (ev.data) this.handleIncoming(ev.data, 'bc');
       };
@@ -95,7 +170,9 @@ export class MultiplayerManager {
       ws.onopen = () => {
         this.wsConnected = true;
         this.wsSupported = true;
-        this.sendHello();
+        if (!this.isSleeping) {
+          this.sendHello();
+        }
         this.emitStatus();
       };
       ws.onmessage = (ev) => {
@@ -162,7 +239,9 @@ export class MultiplayerManager {
         this.mqttConnected = true;
         this.mqttFailures = 0;
         client.subscribe(TOPIC, { qos: 0 }, () => {
-          this.sendHello();
+          if (!this.isSleeping) {
+            this.sendHello();
+          }
         });
         this.emitStatus();
       });
@@ -194,6 +273,176 @@ export class MultiplayerManager {
     }
   }
 
+  // === WEBRTC P2P DATACHANNEL (LOW-LATENCY UNRELIABLE/UNORDERED TRANSPORT) ===
+  maybeInitRtc(peerId) {
+    if (this.destroyed || this.isSleeping || typeof RTCPeerConnection === 'undefined') return;
+    if (this.rtcPeers.has(peerId)) return;
+    // Only lexicographically smaller localId initiates offer to prevent glare
+    if (this.localId >= peerId) return;
+
+    const entry = this.createRtcEntry(peerId);
+    if (!entry) return;
+
+    try {
+      const dc = entry.pc.createDataChannel('race', {
+        ordered: false,
+        maxRetransmits: 0,
+      });
+      this.attachDataChannel(peerId, entry, dc);
+
+      entry.pc
+        .createOffer()
+        .then((offer) => entry.pc.setLocalDescription(offer))
+        .then(() => {
+          if (entry.pc.localDescription) {
+            this.broadcast(
+              'rtc_offer',
+              { to: peerId, sdp: entry.pc.localDescription },
+              { forceShared: true },
+            );
+          }
+        })
+        .catch(() => {
+          this.closeRtcPeer(peerId);
+        });
+    } catch {
+      this.closeRtcPeer(peerId);
+    }
+  }
+
+  createRtcEntry(peerId) {
+    try {
+      const pc = new RTCPeerConnection(RTC_CONFIG);
+      const entry = { pc, dc: null, pendingIce: [] };
+      this.rtcPeers.set(peerId, entry);
+
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate && !this.destroyed && !this.isSleeping) {
+          this.broadcast(
+            'rtc_ice',
+            { to: peerId, candidate: ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate },
+            { forceShared: true },
+          );
+        }
+      };
+
+      pc.ondatachannel = (ev) => {
+        this.attachDataChannel(peerId, entry, ev.channel);
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+          this.closeRtcPeer(peerId);
+        }
+      };
+
+      return entry;
+    } catch {
+      return null;
+    }
+  }
+
+  attachDataChannel(peerId, entry, dc) {
+    entry.dc = dc;
+    dc.onmessage = (ev) => {
+      try {
+        const parsed = JSON.parse(ev.data);
+        this.handleIncoming(parsed, 'rtc');
+      } catch {
+        // ignore malformed packets
+      }
+    };
+    dc.onclose = () => {
+      if (entry.dc === dc) entry.dc = null;
+    };
+    dc.onerror = () => {
+      if (entry.dc === dc) entry.dc = null;
+    };
+  }
+
+  async handleRtcOffer(from, payload) {
+    if (this.isSleeping || typeof RTCPeerConnection === 'undefined') return;
+    let entry = this.rtcPeers.get(from);
+    if (!entry) {
+      entry = this.createRtcEntry(from);
+    }
+    if (!entry) return;
+
+    try {
+      await entry.pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+      for (const ice of entry.pendingIce) {
+        await entry.pc.addIceCandidate(new RTCIceCandidate(ice)).catch(() => {});
+      }
+      entry.pendingIce = [];
+      const answer = await entry.pc.createAnswer();
+      await entry.pc.setLocalDescription(answer);
+      if (entry.pc.localDescription) {
+        this.broadcast(
+          'rtc_answer',
+          { to: from, sdp: entry.pc.localDescription },
+          { forceShared: true },
+        );
+      }
+    } catch {
+      this.closeRtcPeer(from);
+    }
+  }
+
+  async handleRtcAnswer(from, payload) {
+    const entry = this.rtcPeers.get(from);
+    if (!entry) return;
+    try {
+      await entry.pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+      for (const ice of entry.pendingIce) {
+        await entry.pc.addIceCandidate(new RTCIceCandidate(ice)).catch(() => {});
+      }
+      entry.pendingIce = [];
+    } catch {
+      this.closeRtcPeer(from);
+    }
+  }
+
+  async handleRtcIce(from, payload) {
+    if (!payload.candidate) return;
+    let entry = this.rtcPeers.get(from);
+    if (!entry) {
+      entry = this.createRtcEntry(from);
+    }
+    if (!entry) return;
+
+    if (!entry.pc.remoteDescription) {
+      entry.pendingIce.push(payload.candidate);
+      return;
+    }
+    try {
+      await entry.pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+    } catch {
+      // ignore invalid/stale candidate
+    }
+  }
+
+  closeRtcPeer(peerId) {
+    const entry = this.rtcPeers.get(peerId);
+    if (!entry) return;
+    try {
+      entry.dc?.close();
+    } catch {
+      // ignore
+    }
+    try {
+      entry.pc?.close();
+    } catch {
+      // ignore
+    }
+    this.rtcPeers.delete(peerId);
+  }
+
+  closeAllRtc() {
+    for (const id of [...this.rtcPeers.keys()]) {
+      this.closeRtcPeer(id);
+    }
+  }
+
   getConnectionLabel() {
     if (this.mqttConnected) return 'Online (Internet)';
     if (this.wsConnected || this.bc) return 'Lokální síť (Wi-Fi / PC)';
@@ -213,7 +462,7 @@ export class MultiplayerManager {
     });
   }
 
-  broadcast(type, payload) {
+  broadcast(type, payload, options = {}) {
     const envelope = {
       id: `${this.localId}_${++this.msgCounter}`,
       from: this.localId,
@@ -222,6 +471,32 @@ export class MultiplayerManager {
       payload,
     };
     const serialized = JSON.stringify(envelope);
+
+    const preferRtcOnly =
+      !options.forceShared &&
+      (type === 'race_state' || type === 'ping' || type === 'pong');
+
+    let allPeersHaveRtc = this.peers.size > 0;
+    if (preferRtcOnly && this.peers.size > 0) {
+      for (const peerId of this.peers.keys()) {
+        const rtc = this.rtcPeers.get(peerId);
+        if (rtc?.dc && rtc.dc.readyState === 'open') {
+          try {
+            rtc.dc.send(serialized);
+          } catch {
+            allPeersHaveRtc = false;
+          }
+        } else {
+          allPeersHaveRtc = false;
+        }
+      }
+    } else {
+      allPeersHaveRtc = false;
+    }
+
+    if (preferRtcOnly && allPeersHaveRtc) {
+      return;
+    }
 
     if (this.bc) {
       try {
@@ -250,6 +525,7 @@ export class MultiplayerManager {
 
   handleIncoming(msg) {
     if (!msg || !msg.id || !msg.from || msg.from === this.localId) return;
+    if (this.isSleeping) return;
 
     // Deduplicate messages arriving over multiple transports
     if (this.seenMsgs.has(msg.id)) return;
@@ -263,9 +539,20 @@ export class MultiplayerManager {
     const { from, type, payload } = msg;
 
     if (type === 'bye') {
-      if (this.peers.delete(from)) {
+      const removed = this.peers.delete(from);
+      this.closeRtcPeer(from);
+      if (removed) {
         this.emitRoomUpdate();
       }
+      return;
+    }
+
+    // Targeted WebRTC signaling messages
+    if (type === 'rtc_offer' || type === 'rtc_answer' || type === 'rtc_ice') {
+      if (payload?.to !== this.localId) return;
+      if (type === 'rtc_offer') this.handleRtcOffer(from, payload);
+      else if (type === 'rtc_answer') this.handleRtcAnswer(from, payload);
+      else if (type === 'rtc_ice') this.handleRtcIce(from, payload);
       return;
     }
 
@@ -281,13 +568,19 @@ export class MultiplayerManager {
         d: 0,
         lateral: 0,
         speed: 0,
+        steer: 0,
+        throttling: false,
         lean: 0,
         score: 0,
+        turbo: false,
         finished: false,
         finishTime: null,
+        rttMs: 70,
+        stateReceivedAt: 0,
         lastSeen: now,
       };
       this.peers.set(from, peer);
+      this.maybeInitRtc(from);
     }
 
     if (!peer) return;
@@ -301,7 +594,6 @@ export class MultiplayerManager {
       peer.state = payload.state ?? peer.state;
 
       if (payload.lengthId && payload.lengthId !== this.lengthId && this.localState === 'LOBBY') {
-        // Keep shared length synchronized when joining an active lobby
         if (payload.lengthUpdatedAt && payload.lengthUpdatedAt > (this.lastLengthUpdate || 0)) {
           this.lengthId = payload.lengthId;
           this.lastLengthUpdate = payload.lengthUpdatedAt;
@@ -309,8 +601,23 @@ export class MultiplayerManager {
         }
       }
 
-      if (added || this.resolveColorConflict() || prevColor !== peer.color || prevState !== peer.state) {
+      this.maybeInitRtc(from);
+
+      if (added) {
+        const colorChanged = this.resolveColorConflict();
+        if (!colorChanged) {
+          this.sendHello();
+        }
         this.emitRoomUpdate();
+      } else if (this.resolveColorConflict() || prevColor !== peer.color || prevState !== peer.state) {
+        this.emitRoomUpdate();
+      }
+    } else if (type === 'ping') {
+      this.broadcast('pong', { to: from, pingTs: payload.pingTs });
+    } else if (type === 'pong') {
+      if (payload?.to === this.localId && typeof payload.pingTs === 'number') {
+        const sampleRtt = Math.max(2, Math.min(800, performance.now() - payload.pingTs));
+        peer.rttMs = peer.rttMs ? peer.rttMs * 0.65 + sampleRtt * 0.35 : sampleRtt;
       }
     } else if (type === 'length_change') {
       if (payload.lengthId && payload.lengthId !== this.lengthId) {
@@ -319,6 +626,8 @@ export class MultiplayerManager {
         this.callbacks.onLengthChange?.(this.lengthId);
       }
     } else if (type === 'race_start') {
+      const hidden = typeof document !== 'undefined' && document.hidden;
+      if (this.isSleeping || hidden) return;
       if (payload.lengthId) {
         this.lengthId = payload.lengthId;
         this.callbacks.onLengthChange?.(this.lengthId);
@@ -328,13 +637,15 @@ export class MultiplayerManager {
       peer.d = payload.d;
       peer.lateral = payload.lateral;
       peer.speed = payload.speed;
+      peer.steer = payload.steer ?? 0;
+      peer.throttling = Boolean(payload.throttling);
       peer.lean = payload.lean;
       peer.score = payload.score;
-      peer.turbo = !!payload.turbo;
-      peer.finished = !!payload.finished;
+      peer.turbo = Boolean(payload.turbo);
+      peer.finished = Boolean(payload.finished);
       peer.finishTime = payload.finishTime ?? peer.finishTime;
-      if (peer.finished) peer.state = 'FINISHED';
-      else peer.state = 'RACING';
+      peer.stateReceivedAt = performance.now();
+      peer.state = peer.finished ? 'FINISHED' : 'RACING';
     } else if (type === 'race_finish') {
       peer.finished = true;
       peer.finishTime = payload.finishTime;
@@ -376,6 +687,7 @@ export class MultiplayerManager {
   }
 
   selectColor(colorId) {
+    this.markActivity();
     if (this.isColorTaken(colorId)) return false;
     this.localColor = colorId;
     this.sendHello();
@@ -384,17 +696,22 @@ export class MultiplayerManager {
   }
 
   setTrackLength(lengthId) {
+    this.markActivity();
     this.lengthId = lengthId;
     this.lastLengthUpdate = Date.now();
     this.broadcast('length_change', { lengthId });
   }
 
   setLocalState(state) {
+    this.markActivity();
     this.localState = state;
-    this.sendHello();
+    if (!this.isSleeping) {
+      this.sendHello();
+    }
   }
 
   sendHello() {
+    if (this.isSleeping) return;
     this.broadcast('hello', {
       joinedAt: this.joinedAt,
       color: this.localColor,
@@ -404,7 +721,13 @@ export class MultiplayerManager {
     });
   }
 
+  sendLatencyPing() {
+    if (this.isSleeping) return;
+    this.broadcast('ping', { pingTs: performance.now() });
+  }
+
   startRace(seed, lengthId) {
+    this.markActivity();
     this.localState = 'COUNTDOWN';
     this.lengthId = lengthId;
     this.broadcast('race_start', {
@@ -416,6 +739,7 @@ export class MultiplayerManager {
   }
 
   sendRaceState(state) {
+    if (this.isSleeping) return;
     this.broadcast('race_state', state);
   }
 
@@ -457,7 +781,16 @@ export class MultiplayerManager {
     clearInterval(this.heartbeatTimer);
     clearInterval(this.pruneTimer);
     clearTimeout(this.fallbackTimer);
+    window.removeEventListener('pointerdown', this.markActivity);
+    window.removeEventListener('pointermove', this.markActivity);
+    window.removeEventListener('touchstart', this.markActivity);
+    window.removeEventListener('keydown', this.markActivity);
     window.removeEventListener('beforeunload', this.handleUnload);
+    window.removeEventListener('pagehide', this.handlePageHide);
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+    }
+    this.closeAllRtc();
     try {
       this.bc?.close();
     } catch {

@@ -3,4 +3,5 @@ dist/
 android/
 .capacitor/
 *.log
+*.apk
 .DS_Store

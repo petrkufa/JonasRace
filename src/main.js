@@ -131,10 +131,14 @@ appEl.addEventListener('pointerdown', (e) => {
   }
   if (gameState !== 'RACING' && gameState !== 'COUNTDOWN') return;
   sound.unlock();
+  const wasActive = pointerActive;
   pointerActive = true;
   activePointerId = e.pointerId;
   dragAnchorX = e.clientX;
   dragCurrentX = e.clientX;
+  if (gameState === 'RACING' && !wasActive) {
+    sendLocalRaceStateNow();
+  }
 });
 
 window.addEventListener('pointermove', (e) => {
@@ -151,21 +155,32 @@ function releasePointer(e) {
   if (pointerActive && e.pointerId === activePointerId) {
     pointerActive = false;
     activePointerId = null;
+    if (gameState === 'RACING') {
+      sendLocalRaceStateNow();
+    }
   }
 }
 window.addEventListener('pointerup', releasePointer);
 window.addEventListener('pointercancel', releasePointer);
 
 window.addEventListener('keydown', (e) => {
+  const wasUp = keys.up;
   if (e.code === 'ArrowUp' || e.code === 'KeyW' || e.code === 'Space') keys.up = true;
   if (e.code === 'ArrowLeft' || e.code === 'KeyA') keys.left = true;
   if (e.code === 'ArrowRight' || e.code === 'KeyD') keys.right = true;
+  if (gameState === 'RACING' && !wasUp && keys.up) {
+    sendLocalRaceStateNow();
+  }
 });
 
 window.addEventListener('keyup', (e) => {
+  const wasUp = keys.up;
   if (e.code === 'ArrowUp' || e.code === 'KeyW' || e.code === 'Space') keys.up = false;
   if (e.code === 'ArrowLeft' || e.code === 'KeyA') keys.left = false;
   if (e.code === 'ArrowRight' || e.code === 'KeyD') keys.right = false;
+  if (gameState === 'RACING' && wasUp && !keys.up) {
+    sendLocalRaceStateNow();
+  }
 });
 
 function getSteerInput() {
@@ -360,6 +375,22 @@ function loadSceneTrack(seed, lengthId) {
   hud.setTrackPath(currentTrack.minimapPoints);
 }
 
+function sendLocalRaceStateNow(now = performance.now()) {
+  lastNetSend = now;
+  network.sendRaceState({
+    d: localRider.d,
+    lateral: localRider.lateral,
+    speed: localRider.speed,
+    steer: Number(localRider.steer.toFixed(3)),
+    throttling: isThrottlingInput(),
+    lean: localRider.lean,
+    score: Math.floor(localRider.score),
+    turbo: localRider.turboTimer > 0,
+    finished: localRider.finished,
+    finishTime: localRider.finishTime,
+  });
+}
+
 function ensureRemoteRiderVisual(peer) {
   let entry = remoteRiders.get(peer.id);
   if (!entry) {
@@ -368,12 +399,17 @@ function ensureRemoteRiderVisual(peer) {
       color: peer.color,
       d: peer.d || 8,
       lateral: peer.lateral || 0,
+      netTargetD: peer.d || 8,
+      netTargetLat: peer.lateral || 0,
       speed: peer.speed || 0,
+      steer: peer.steer || 0,
+      throttling: Boolean(peer.throttling),
       lean: peer.lean || 0,
       score: peer.score || 0,
       turbo: false,
       finished: false,
       finishTime: null,
+      lastPacketAt: 0,
       visual: createBikeMesh(peer.color, false),
     };
     scene.add(entry.visual.group);
@@ -423,8 +459,13 @@ function beginCountdown(seed, lengthId) {
       const remote = ensureRemoteRiderVisual(p);
       remote.d = 8;
       remote.lateral = startLat;
+      remote.netTargetD = 8;
+      remote.netTargetLat = startLat;
       remote.speed = 0;
+      remote.steer = 0;
+      remote.throttling = false;
       remote.lean = 0;
+      remote.lastPacketAt = 0;
     }
   });
 
@@ -557,6 +598,8 @@ function finishLocalRace() {
     d: currentTrack.totalMeters,
     lateral: localRider.lateral,
     speed: localRider.speed,
+    steer: 0,
+    throttling: false,
     lean: 0,
     score: Math.floor(localRider.score),
     turbo: false,
@@ -628,28 +671,79 @@ function positionBikeAndCamera(dt, timeSec, snapImmediate = false) {
 function updateRemoteBikes(dt, timeSec) {
   if (!currentTrack) return;
 
-  // Sync peers active in this race
+  const activePeerIds = new Set();
+
+  // Sync peers active in this race with 60 FPS dead-reckoning
   for (const peer of network.peers.values()) {
-    if (peer.state === 'RACING' || peer.state === 'COUNTDOWN' || peer.state === 'FINISHED') {
-      const entry = ensureRemoteRiderVisual(peer);
-      const blend = 1 - Math.exp(-12 * dt);
-      entry.d += ((peer.d ?? entry.d) - entry.d) * blend;
-      entry.lateral += ((peer.lateral ?? entry.lateral) - entry.lateral) * blend;
-      entry.speed += ((peer.speed ?? entry.speed) - entry.speed) * blend;
-      entry.lean += ((peer.lean ?? entry.lean) - entry.lean) * blend;
+    if (peer.state !== 'RACING' && peer.state !== 'COUNTDOWN' && peer.state !== 'FINISHED') {
+      continue;
+    }
+    activePeerIds.add(peer.id);
+    const entry = ensureRemoteRiderVisual(peer);
+
+    if (peer.stateReceivedAt && peer.stateReceivedAt !== entry.lastPacketAt) {
+      entry.lastPacketAt = peer.stateReceivedAt;
+      const oneWaySec = Math.min(0.15, ((peer.rttMs || 60) * 0.5) / 1000);
+      entry.netTargetD = (peer.d ?? entry.d) + (peer.speed ?? 0) * oneWaySec;
+      entry.netTargetLat = peer.lateral ?? entry.lateral;
+      entry.speed = peer.speed ?? entry.speed;
+      entry.steer = peer.steer ?? 0;
+      entry.throttling = Boolean(peer.throttling);
       entry.turbo = Boolean(peer.turbo);
       entry.finished = Boolean(peer.finished);
-
-      const frame = currentTrack.sampleAt(entry.d);
-      entry.visual.group.position.copy(frame.pos).addScaledVector(frame.right, entry.lateral);
-      entry.visual.group.rotation.y = frame.yaw;
-      entry.visual.updateVisual(dt, entry.speed, entry.lean, entry.turbo, 0, timeSec);
     }
+
+    if (!entry.finished && peer.state === 'RACING') {
+      const topSpeed = entry.turbo ? 66 : 52;
+      if (entry.throttling || entry.turbo) {
+        const accel = entry.turbo ? 38 : 22;
+        if (entry.speed < topSpeed) {
+          entry.speed = Math.min(topSpeed, entry.speed + accel * dt);
+        } else {
+          entry.speed = Math.max(topSpeed, entry.speed - 18 * dt);
+        }
+      } else {
+        entry.speed = Math.max(0, entry.speed - 28 * dt);
+      }
+
+      entry.netTargetD += entry.speed * dt;
+      entry.d += entry.speed * dt;
+      const dErr = entry.netTargetD - entry.d;
+      if (Math.abs(dErr) > 18) {
+        entry.d = entry.netTargetD;
+      } else {
+        entry.d += dErr * Math.min(1, dt * 14);
+      }
+
+      const frameNow = currentTrack.sampleAt(entry.d);
+      const speedSteerFactor = 0.28 + 0.72 * Math.min(1, entry.speed / 24);
+      const latVel =
+        entry.steer * 11.8 * speedSteerFactor -
+        frameNow.curvature * entry.speed * entry.speed * 0.14;
+      entry.netTargetLat = Math.max(
+        -RIDE_HALF_LIMIT,
+        Math.min(RIDE_HALF_LIMIT, entry.netTargetLat + latVel * dt),
+      );
+      entry.lateral += latVel * dt + (entry.netTargetLat - entry.lateral) * Math.min(1, dt * 16);
+      entry.lateral = Math.max(-RIDE_HALF_LIMIT, Math.min(RIDE_HALF_LIMIT, entry.lateral));
+
+      const targetLean = -entry.steer * 0.44 * Math.min(1, entry.speed / 15 + 0.2);
+      entry.lean += (targetLean - entry.lean) * Math.min(1, dt * 10);
+    } else if (entry.finished) {
+      entry.speed = Math.max(0, entry.speed - 24 * dt);
+      entry.d = Math.min(currentTrack.totalMeters + 25, entry.d + entry.speed * dt);
+      entry.lean += (0 - entry.lean) * Math.min(1, dt * 8);
+    }
+
+    const frame = currentTrack.sampleAt(entry.d);
+    entry.visual.group.position.copy(frame.pos).addScaledVector(frame.right, entry.lateral);
+    entry.visual.group.rotation.y = frame.yaw;
+    entry.visual.updateVisual(dt, entry.speed, entry.lean, entry.turbo, 0, timeSec);
   }
 
-  // Clean up disconnected peers
+  // Clean up disconnected or lobby-returned peers
   for (const [id, entry] of remoteRiders.entries()) {
-    if (!network.peers.has(id)) {
+    if (!activePeerIds.has(id)) {
       scene.remove(entry.visual.group);
       remoteRiders.delete(id);
     }
@@ -877,18 +971,8 @@ function animate(now) {
     positionBikeAndCamera(dt, timeSec);
     updateHudDisplay(dt);
 
-    if (now - lastNetSend > 55) {
-      lastNetSend = now;
-      network.sendRaceState({
-        d: localRider.d,
-        lateral: localRider.lateral,
-        speed: localRider.speed,
-        lean: localRider.lean,
-        score: Math.floor(localRider.score),
-        turbo: localRider.turboTimer > 0,
-        finished: localRider.finished,
-        finishTime: localRider.finishTime,
-      });
+    if (now - lastNetSend >= 30) {
+      sendLocalRaceStateNow(now);
     }
   } else if (gameState === 'PAUSED') {
     // Keep remote riders updating smoothly when paused in multiplayer
