@@ -658,7 +658,7 @@ function buildRaceStandings() {
 
   entries.sort((a, b) => {
     if (a.finished && b.finished) {
-      return (a.finishTime ?? 9999) - (b.finishTime ?? 9999);
+      return (a.finishTime ?? Infinity) - (b.finishTime ?? Infinity);
     }
     if (a.finished) return -1;
     if (b.finished) return 1;
@@ -671,27 +671,37 @@ function buildRaceStandings() {
 function renderPodium() {
   const standings = buildRaceStandings();
   const localRank = standings.findIndex((e) => e.isLocal) + 1;
+  const bestTime =
+    standings.find((e) => e.finished && e.finishTime != null)?.finishTime ?? null;
 
   finishTitleEl.textContent = 'CÍL ZÁVODU!';
   finishSubtitleEl.textContent =
     standings.length > 1
-      ? `${localRank}. MÍSTO z ${standings.length}!`
-      : `Trať projeta za ${localRider.finishTime.toFixed(1)} s!`;
+      ? `${localRank}. MÍSTO (${localRider.finishTime.toFixed(2)} s)`
+      : `Čas v cíli: ${localRider.finishTime.toFixed(2)} s`;
 
   podiumListEl.innerHTML = '';
   standings.forEach((entry, idx) => {
     const palette = BIKE_COLORS[entry.color] || BIKE_COLORS.red;
     const row = document.createElement('div');
     row.className = `podium-row${entry.isLocal ? ' local' : ''}`;
-    const timeText = entry.finished && entry.finishTime != null
-      ? `${entry.finishTime.toFixed(1)} s`
-      : `${Math.round((entry.d / currentTrack.totalMeters) * 100)} %`;
+    let metaText;
+    if (entry.finished && entry.finishTime != null) {
+      if (idx === 0 || bestTime == null) {
+        metaText = `${entry.finishTime.toFixed(2)} s`;
+      } else {
+        const diff = Math.max(0, entry.finishTime - bestTime);
+        metaText = `${entry.finishTime.toFixed(2)} s (+${diff.toFixed(2)} s)`;
+      }
+    } else {
+      metaText = `Na trati (${Math.round((entry.d / currentTrack.totalMeters) * 100)} %)`;
+    }
     const readySuffix = entry.ready ? ' • ✓ Připraven' : '';
     row.innerHTML = `
       <span class="podium-rank">${idx + 1}.</span>
       <span class="player-dot" style="background:${palette.hex}"></span>
       <span>${entry.isLocal ? 'Ty' : 'Kamarád'} (${palette.label})</span>
-      <span class="podium-meta">${timeText} • ${entry.score} b.${readySuffix}</span>
+      <span class="podium-meta">${metaText}${readySuffix}</span>
     `;
     podiumListEl.appendChild(row);
   });
@@ -724,7 +734,6 @@ function renderPodium() {
 function finishLocalRace() {
   localRider.finished = true;
   localRider.finishTime = raceElapsed;
-  localRider.score += 250;
   localRider.jumpY = 0;
   localRider.jumpVelY = 0;
   gameState = 'FINISHED';
@@ -984,7 +993,6 @@ function updateLocalPhysics(dt) {
     if (item.type === 'ramp' && item.cooldown <= 0 && localRider.jumpY <= 0.12) {
       item.cooldown = 1.2;
       localRider.jumpVelY = Math.max(8.5, Math.min(13.5, localRider.speed * 0.24));
-      localRider.score += 120;
       sound.playJump();
       showBanner('SKOK!');
     } else if (item.type === 'coin' && !item.collected) {
@@ -993,14 +1001,12 @@ function updateLocalPhysics(dt) {
         item.collected = true;
         item.mesh.visible = false;
         localRider.coins += 1;
-        localRider.score += 100;
         sound.playCoin();
       }
     } else if (item.type === 'turbo' && item.cooldown <= 0 && localRider.jumpY < 0.7) {
       item.cooldown = 1.6;
       localRider.turboTimer = 2.2;
       localRider.speed = Math.max(localRider.speed, (220 + localRider.coins) / 3.6);
-      localRider.score += 150;
       sound.playTurbo();
       showBanner('TURBO!');
     } else if (item.type === 'cone' && !item.hit && localRider.jumpY <= 0.35) {
@@ -1016,14 +1022,6 @@ function updateLocalPhysics(dt) {
       localRider.speed = Math.min(localRider.speed, 26);
       sound.playSplash();
     }
-  }
-
-  // Distance points while driving fast
-  localRider.scoreAccum += localRider.speed * dt * 0.45;
-  if (localRider.scoreAccum >= 1) {
-    const pts = Math.floor(localRider.scoreAccum);
-    localRider.score += pts;
-    localRider.scoreAccum -= pts;
   }
 
   sound.updateEngine(localRider.speed * 3.6, throttling, localRider.turboTimer > 0);
@@ -1054,7 +1052,7 @@ function updateHudDisplay(dt) {
   }
 
   hud.update({
-    score: localRider.score,
+    raceTime: localRider.finished && localRider.finishTime != null ? localRider.finishTime : raceElapsed,
     coins: localRider.coins,
     speedKmh: localRider.speed * 3.6,
     place,

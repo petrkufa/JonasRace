@@ -50,11 +50,11 @@ export class RaceHUD {
     }));
   }
 
-  update({ score, coins = 0, speedKmh, place, totalPlayers, progressPct, riders, dt }) {
-    const scoreStr = String(Math.floor(score));
-    if (scoreStr !== this.lastScoreText) {
-      this.scoreEl.textContent = scoreStr;
-      this.lastScoreText = scoreStr;
+  update({ raceTime = 0, coins = 0, speedKmh, place, totalPlayers, progressPct, riders, dt }) {
+    const timeStr = `${raceTime.toFixed(1)}s`;
+    if (timeStr !== this.lastScoreText) {
+      this.scoreEl.textContent = timeStr;
+      this.lastScoreText = timeStr;
     }
 
     if (this.coinsEl) {
